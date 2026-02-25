@@ -1,295 +1,374 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import {
-  fetchProducts,
-  createProduct,
-  updateProduct,
-  deleteProduct,
-} from "../../api/products.api";
-import { Product } from "../../types/products";
 import ProductTable from "./components/ProductTable";
 import ProductFormModal from "./components/ProductFormModal";
-import { useAuth } from "../../lib/auth";
+import { sortProducts } from "../../utils/productSort";
+import type { Product } from "../../types/products";
 
-function sortDescKo(arr: string[]) {
-  return arr.sort((a, b) => b.localeCompare(a, "ko"));
+/**
+ * ProductsPage.tsx (정상 빌드/기능 복구 + 정렬 유지 + 인증 헤더 강화)
+ * - 기능: 자동검색(디바운스), 등록/수정/삭제, 업로드/다운로드
+ * - 정렬: productSort.ts (숫자→영어→한글 / 항목→구분→모델명→규격)
+ * - 인증: credentials: "include" 유지 + local/sessionStorage 전체 스캔으로 JWT 토큰 자동 탐색
+ */
+
+/** JWT처럼 보이는 토큰(aaa.bbb.ccc)만 골라냄 */
+function findJwtLikeToken(val: any): string | null {
+  if (!val) return null;
+
+  if (typeof val === "string") {
+    const s = val.trim().replace(/^Bearer\s+/i, "");
+    if (/^[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+$/.test(s)) return s;
+    return null;
+  }
+
+  if (typeof val === "object") {
+    const keys = ["access_token", "accessToken", "token", "jwt", "id_token", "idToken"];
+    for (const k of keys) {
+      const t = findJwtLikeToken((val as any)[k]);
+      if (t) return t;
+    }
+  }
+
+  return null;
 }
 
-
-function getAuthHeader(): Record<string, string> {
-  // ✅ 업링크 토큰이 어디에 저장되어 있는지 환경마다 달라서, "JWT처럼 생긴 값"을 찾아서 사용합니다.
-  // - 잘못된 토큰(예: refresh token, JSON 전체 문자열)을 넣으면 401이 나므로, JWT 패턴(점 2개)을 만족할 때만 Authorization을 붙입니다.
-  const isJwtLike = (v: string) => {
-    const t = (v || "").trim().replace(/^Bearer\s+/i, "").replace(/^"|"$/g, "");
-    // JWT는 보통 '.'이 2개(3파트)입니다.
-    if (!t) return false;
-    const parts = t.split(".");
-    if (parts.length !== 3) return false;
-    // 각 파트가 base64url-ish 인지 대충 검사
-    return parts.every((p) => /^[A-Za-z0-9_-]+$/.test(p) && p.length >= 8);
-  };
-
-  const normalize = (v: string) => (v || "").trim().replace(/^Bearer\s+/i, "").replace(/^"|"$/g, "");
-
+function scanStorageForToken(storage: Storage): string | null {
   try {
-    // 1) localStorage 전체 스캔: 키 이름 우선순위(ACCESS > TOKEN > 그 외), refresh는 제외
-    const candidates: Array<{ key: string; token: string; score: number }> = [];
-    for (let i = 0; i < localStorage.length; i++) {
-      const key = localStorage.key(i) || "";
-      const raw = localStorage.getItem(key) || "";
-      const k = key.toLowerCase();
+    for (let i = 0; i < storage.length; i++) {
+      const key = storage.key(i);
+      if (!key) continue;
 
-      // refresh 류는 제외(대부분 access token과 같은 형태라도 서버에선 invalid 처리)
-      if (k.includes("refresh")) continue;
+      const raw = storage.getItem(key);
+      if (!raw) continue;
 
-      // 값이 JWT-like 문자열인 경우
-      if (isJwtLike(raw)) {
-        const token = normalize(raw);
-        let score = 10;
-        if (k.includes("access")) score += 30;
-        if (k.includes("token")) score += 10;
-        if (k.includes("auth")) score += 5;
-        candidates.push({ key, token, score });
-        continue;
-      }
+      // 1) raw가 토큰일 때
+      const direct = findJwtLikeToken(raw);
+      if (direct) return direct;
 
-      // 값이 JSON이면 파싱해서 token 후보를 뽑는다
-      const trimmed = raw.trim();
-      if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+      // 2) JSON 문자열일 때
+      if (raw.startsWith("{") || raw.startsWith("[")) {
         try {
-          const obj: any = JSON.parse(raw);
-          const possibles = [
-            obj?.access_token,
-            obj?.token,
-            obj?.jwt,
-            obj?.data?.access_token,
-            obj?.data?.token,
-            obj?.session?.access_token,
-            obj?.session?.token,
-          ].filter((x) => typeof x === "string") as string[];
-
-          for (const pv of possibles) {
-            if (!pv) continue;
-            if (!isJwtLike(pv)) continue;
-            const token = normalize(pv);
-            let score = 8;
-            if (k.includes("access")) score += 30;
-            if (k.includes("token")) score += 10;
-            if (k.includes("auth")) score += 5;
-            candidates.push({ key, token, score });
-          }
+          const obj = JSON.parse(raw);
+          const t = findJwtLikeToken(obj);
+          if (t) return t;
         } catch {
           // ignore
         }
       }
     }
-
-    if (candidates.length) {
-      candidates.sort((a, b) => b.score - a.score);
-      return { Authorization: `Bearer ${candidates[0].token}` };
-    }
   } catch {
     // ignore
   }
-
-  // 토큰을 확신할 수 없으면 Authorization을 붙이지 않음(잘못된 토큰으로 401 유발 방지)
-  return {};
+  return null;
 }
 
+function getAuthHeaders(): Record<string, string> {
+  const token = scanStorageForToken(localStorage) || scanStorageForToken(sessionStorage);
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
 
+async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(url, {
+    credentials: "include",
+    ...init,
+    headers: {
+      ...getAuthHeaders(),
+      ...(init?.headers || {}),
+    } as any,
+  });
+
+  if (!res.ok) {
+    const msg = await res.text().catch(() => "");
+    throw new Error(`${res.status} ${res.statusText} ${msg}`);
+  }
+
+  return (await res.json()) as T;
+}
 
 export default function ProductsPage() {
-  const { user } = useAuth();
-
-  const roleId: number | null = (user as any)?.role_id ?? null;
-  const canManage = roleId === 6 || roleId === 7;
-
   const [rows, setRows] = useState<Product[]>([]);
-  const [q, setQ] = useState("");
   const [loading, setLoading] = useState(false);
-  const [modalOpen, setModalOpen] = useState(false);
-  const [editing, setEditing] = useState<Product | null>(null);
 
-  const [itemOptions, setItemOptions] = useState<string[]>([]);
-  const [categoryOptions, setCategoryOptions] = useState<string[]>([]);
-
+  const [q, setQ] = useState("");
+  const [roleId, setRoleId] = useState<number>(0);
   const debounceRef = useRef<number | null>(null);
 
-  async function load(search?: string) {
+  // 모달
+  const [modalOpen, setModalOpen] = useState(false);
+  const [modalTitle, setModalTitle] = useState("제품 등록");
+  const [editing, setEditing] = useState<Product | null>(null);
+
+  // ✅ 관리 버튼 노출: 관리자(6), 운영자(7)만
+  const canManage = roleId === 6 || roleId === 7;
+// ✅ 정렬(표시만)
+  const sortedRows = useMemo(() => sortProducts(rows), [rows]);
+
+  // 콤보 옵션
+  const itemOptions = useMemo(() => {
+    const s = new Set<string>();
+    rows.forEach((r) => r.item_name && s.add(r.item_name));
+    return Array.from(s).sort();
+  }, [rows]);
+
+  const categoryOptions = useMemo(() => {
+    const s = new Set<string>();
+    rows.forEach((r) => r.category_name && s.add(r.category_name));
+    return Array.from(s).sort();
+  }, [rows]);
+
+  const loadProducts = async (query: string) => {
     setLoading(true);
     try {
-      const data = await fetchProducts({ q: (search ?? q).trim() });
-      setRows(data);
-
-      const items = Array.from(new Set(data.map((r) => (r.item_name || "").trim()).filter(Boolean)));
-      const cats = Array.from(new Set(data.map((r) => (r.category_name || "").trim()).filter(Boolean)));
-      setItemOptions(sortDescKo(items));
-      setCategoryOptions(sortDescKo(cats));
+      const qs = new URLSearchParams();
+      if (query.trim()) qs.set("q", query.trim());
+      const data = await fetchJson<Product[]>(`/api/products?${qs.toString()}`);
+      setRows(Array.isArray(data) ? data : []);
     } finally {
       setLoading(false);
     }
-  }
 
-  // ✅ 초기 로드
+  // ✅ 권한: 관리자(6), 운영자(7)만 관리 버튼 노출
+  const loadRoleId = async () => {
+    const endpoints = ["/api/auth/me", "/api/users/me", "/api/me"];
+    for (const ep of endpoints) {
+      try {
+        const me: any = await fetchJson<any>(ep, { method: "GET" });
+        const rid =
+          me?.role_id ??
+          me?.roleId ??
+          me?.role?.id ??
+          me?.user?.role_id ??
+          me?.user?.roleId ??
+          me?.user?.role?.id ??
+          null;
+        if (rid !== null && rid !== undefined && !Number.isNaN(Number(rid))) {
+          setRoleId(Number(rid));
+          return;
+        }
+      } catch (e) {
+        // 다음 엔드포인트 시도
+      }
+    }
+    setRoleId(0);
+  };
+
+  };
+
   useEffect(() => {
-    load("");
+    loadProducts("");
+    loadRoleId();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ✅ 검색(q) 변경 시 서버 검색 재호출 (디바운스)
+  // ✅ 자동 검색(디바운스)
   useEffect(() => {
     if (debounceRef.current) window.clearTimeout(debounceRef.current);
     debounceRef.current = window.setTimeout(() => {
-      load(q);
+      loadProducts(q);
     }, 250);
+
     return () => {
       if (debounceRef.current) window.clearTimeout(debounceRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [q]);
 
-  async function onUpload(file: File) {
-    // ✅ 제품 업로드: products.api 래퍼 대신 직접 업로드(폼데이터)로 안정화
+  const onOpenCreate = () => {
+    setEditing(null);
+    setModalTitle("제품 등록");
+    setModalOpen(true);
+  };
+
+  const onOpenEdit = (row: Product) => {
+    setEditing(row);
+    setModalTitle("제품 수정");
+    setModalOpen(true);
+  };
+
+  const onDelete = async (row: Product) => {
+    const ok = window.confirm(`삭제(비활성화) 하시겠습니까?\n- ${row.name}`);
+    if (!ok) return;
+
+    try {
+      await fetchJson(`/api/products/${row.id}`, { method: "DELETE" });
+      await loadProducts(q);
+    } catch (err: any) {
+      alert(err?.message || "삭제 실패");
+    }
+  };
+
+  const onSave = async (payload: Partial<Product>) => {
+    try {
+      if (editing?.id) {
+        await fetchJson(`/api/products/${editing.id}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+      } else {
+        await fetchJson(`/api/products`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+      }
+
+      setModalOpen(false);
+      await loadProducts(q);
+    } catch (err: any) {
+      alert(err?.message || "저장 실패");
+    }
+  };
+
+  // 업로드/다운로드
+  const fileRef = useRef<HTMLInputElement | null>(null);
+  const onUploadClick = () => fileRef.current?.click();
+
+  const onUploadFile = async (file: File) => {
     const fd = new FormData();
     fd.append("file", file);
 
-    let data: any = null;
-    try {
-      const resp = await fetch(`/api/products/upload`, {
-        method: "POST",
-        body: fd,
-        credentials: "include",
-        headers: { ...getAuthHeader() },
-      });
+    const res = await fetch("/api/products/upload", {
+      method: "POST",
+      body: fd,
+      credentials: "include",
+      headers: { ...getAuthHeaders() },
+    });
 
-      // 서버가 JSON을 반환 (ok/imported/errors)
-      const ct = resp.headers.get("content-type") || "";
-      if (ct.includes("application/json")) data = await resp.json();
-      else data = { ok: resp.ok };
-
-      if (!resp.ok || !data?.ok) {
-        const msg =
-          (data?.detail ? String(data.detail) : "") ||
-          (Array.isArray(data?.errors) ? data.errors.join("\\n") : "") ||
-          `HTTP ${resp.status}`;
-        alert("업로드 실패\n" + msg);
-        return;
-      }
-
-      alert(`업로드 완료: ${data?.imported ?? 0}건`);
-      // ✅ 업로드 후 즉시 재조회(검색어 유지)
-      await load((q ?? "").trim());
-    } catch (e: any) {
-      alert("업로드 실패\n" + (e?.message || String(e)));
+    if (!res.ok) {
+      const msg = await res.text().catch(() => "");
+      throw new Error(`${res.status} ${res.statusText} ${msg}`);
     }
-  }
 
+    const data: any = await res.json().catch(() => ({}));
+    const imported = data?.imported ?? (data?.inserted ?? 0) + (data?.updated ?? 0);
+    alert(`업로드 완료: ${imported}건 (신규 ${data?.inserted ?? 0}, 수정 ${data?.updated ?? 0})`);
+    await loadProducts(q);
+  };
 
-  async function onDownload() {
+  const onDownload = async () => {
     try {
-      const resp = await fetch(`/api/products/download`, {
+      const res = await fetch("/api/products/download", {
         method: "GET",
         credentials: "include",
-        headers: { ...getAuthHeader() },
+        headers: { ...getAuthHeaders() },
       });
-      if (!resp.ok) {
-        const txt = await resp.text().catch(() => "");
-        alert("다운로드 실패\n" + (txt || `HTTP ${resp.status}`));
-        return;
+
+      if (!res.ok) {
+        const msg = await res.text().catch(() => "");
+        throw new Error(`${res.status} ${res.statusText} ${msg}`);
       }
 
-      const blob = await resp.blob();
-      // 파일명 추출(Content-Disposition)
-      const cd = resp.headers.get("content-disposition") || "";
-      const match = cd.match(/filename\*=UTF-8''([^;]+)|filename=\"?([^\"]+)\"?/i);
-      const filenameRaw = decodeURIComponent((match?.[1] || match?.[2] || "").trim());
-      const filename = filenameRaw || `products.xlsx`;
-
+      const blob = await res.blob();
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
+
+      const disp = res.headers.get("content-disposition") || "";
+      const m = disp.match(/filename\*?=([^;]+)/i);
+      let filename = "products.xlsx";
+      if (m?.[1]) filename = m[1].trim().replace(/^UTF-8''/i, "").replace(/\"/g, "").replace(/"/g, "");
       a.download = filename;
+
       document.body.appendChild(a);
       a.click();
       a.remove();
       window.URL.revokeObjectURL(url);
-    } catch (e: any) {
-      alert("다운로드 실패\n" + (e?.message || String(e)));
+    } catch (err: any) {
+      alert(err?.message || "다운로드 실패");
     }
-  }
-
-  async function onSave(payload: Partial<Product>) {
-    if (editing) {
-      await updateProduct(editing.id, payload);
-    } else {
-      await createProduct(payload);
-    }
-    setModalOpen(false);
-    setEditing(null);
-    await load(q);
-  }
-
-  async function onDelete(row: Product) {
-    if (!confirm(`삭제할까요?\n${row.name}`)) return;
-    await deleteProduct(row.id);
-    await load(q);
-  }
+  };
 
   return (
-    <div style={{ padding: 16 }}>
-      <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 12 }}>
-        <h2 style={{ margin: 0 }}>제품(자재관리)</h2>
-        <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+    <div style={{ padding: 10 }}>
+      <h2 style={{ marginBottom: 12 }}>제품(자재관리)</h2>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 20, marginBottom: 12 }}>
+        {/* 왼쪽: 검색 + 신규등록 */}
+        <div style={{ display: "flex", alignItems: "center", gap: 15, flex: "0 0 auto" }}>
           <input
             value={q}
             onChange={(e) => setQ(e.target.value)}
-            placeholder="제품 검색(항목/구분/모델명/규격/비고)"
-            style={{ padding: "6px 10px", minWidth: 320 }}
+            placeholder="검색 (항목/구분/모델명/규격/비고)"
+            style={{
+              width: 350, // 기존 대비 축소(대략 1/4 체감)
+              padding: "8px 10px",
+              borderRadius: 8,
+              border: "1px solid rgba(255,255,255,0.15)",
+              background: "rgba(0,0,0,0.35)",
+              color: "#fff",
+            }}
           />
-
           {canManage && (
-            <>
-              <button onClick={() => { setEditing(null); setModalOpen(true); }}>
-                등록
-              </button>
-              <label style={{ border: "1px solid #ccc", padding: "6px 10px", cursor: "pointer" }}>
-                업로드
-                <input
-                  type="file"
-                  accept=".xlsx"
-                  style={{ display: "none" }}
-                  onChange={(e) => {
-                    const f = e.target.files?.[0];
-                    if (f) onUpload(f);
-                    e.currentTarget.value = "";
-                  }}
-                />
-              </label>
-              <button onClick={onDownload}>다운로드</button>
-            </>
+
+          <button
+            onClick={onOpenCreate}
+            style={{
+              padding: "8px 14px",
+              borderRadius: 10,
+              border: "1px solid rgba(255,255,255,0.20)",
+              background: "linear-gradient(180deg, #2563EB 0%, #1D4ED8 100%)",
+              color: "#fff",
+              fontWeight: 700,
+              letterSpacing: "0.2px",
+              cursor: "pointer",
+              whiteSpace: "nowrap",
+            }}
+          >
+            +신규 등록
+          </button>
           )}
         </div>
+
+        {/* 오른쪽: 업로드/다운로드 */}
+        {canManage && (
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <button onClick={onUploadClick} style={{ padding: "8px 12px" }}>
+              파일 업로드
+            </button>
+            <button onClick={onDownload} style={{ padding: "8px 12px" }}>
+              다운로드
+            </button>
+
+            <input
+              ref={fileRef}
+              type="file"
+              accept=".xlsx"
+              style={{ display: "none" }}
+              onChange={async (e) => {
+                const f = e.target.files?.[0];
+                if (!f) return;
+
+                try {
+                  await onUploadFile(f);
+                } catch (err: any) {
+                  alert(err?.message || "업로드 실패");
+                } finally {
+                  e.currentTarget.value = "";
+                }
+              }}
+            />
+          </div>
+        )}
       </div>
 
-      {/* ✅ 서버에서 이미 항목/구분/규격/비고까지 검색 필터링된 rows를 그대로 표시 */}
       <ProductTable
-        rows={rows}
+        rows={sortedRows}
         loading={loading}
         roleId={roleId}
-        onEdit={(r) => { setEditing(r); setModalOpen(true); }}
+        forceManage={canManage}
+        onEdit={onOpenEdit}
         onDelete={onDelete}
       />
 
-      {canManage && (
-        <ProductFormModal
-          open={modalOpen}
-          title={editing ? "제품 수정" : "제품 등록"}
-          initial={editing}
-          itemOptions={itemOptions}
-          categoryOptions={categoryOptions}
-          onClose={() => { setModalOpen(false); setEditing(null); }}
-          onSave={onSave}
-        />
-      )}
+      <ProductFormModal
+        open={modalOpen}
+        title={modalTitle}
+        initial={editing}
+        itemOptions={itemOptions}
+        categoryOptions={categoryOptions}
+        onClose={() => setModalOpen(false)}
+        onSave={onSave}
+      />
     </div>
   );
 }
