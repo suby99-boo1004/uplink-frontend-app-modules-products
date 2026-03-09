@@ -5,22 +5,24 @@ import { sortProducts } from "../../utils/productSort";
 import type { Product } from "../../types/products";
 
 /**
- * ProductsPage.tsx (정상 빌드/기능 복구 + 정렬 유지 + 인증 헤더 강화)
+ * ProductsPage.tsx
  * - 기능: 자동검색(디바운스), 등록/수정/삭제, 업로드/다운로드
  * - 정렬: productSort.ts (숫자→영어→한글 / 항목→구분→모델명→규격)
  * - 인증: credentials: "include" 유지 + local/sessionStorage 전체 스캔으로 JWT 토큰 자동 탐색
+ *
+ * ✅ 이번 수정(대표님 요구):
+ * - 관리자(6), 운영자(7)만: 신규등록/업로드/다운로드 + 테이블의 수정/삭제(테이블은 roleId로 이미 제어)
+ * - 그 외 UI/기능은 고정 (문법/구조 깨짐만 복구)
  */
 
 /** JWT처럼 보이는 토큰(aaa.bbb.ccc)만 골라냄 */
 function findJwtLikeToken(val: any): string | null {
   if (!val) return null;
-
   if (typeof val === "string") {
     const s = val.trim().replace(/^Bearer\s+/i, "");
     if (/^[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+$/.test(s)) return s;
     return null;
   }
-
   if (typeof val === "object") {
     const keys = ["access_token", "accessToken", "token", "jwt", "id_token", "idToken"];
     for (const k of keys) {
@@ -28,7 +30,6 @@ function findJwtLikeToken(val: any): string | null {
       if (t) return t;
     }
   }
-
   return null;
 }
 
@@ -37,7 +38,6 @@ function scanStorageForToken(storage: Storage): string | null {
     for (let i = 0; i < storage.length; i++) {
       const key = storage.key(i);
       if (!key) continue;
-
       const raw = storage.getItem(key);
       if (!raw) continue;
 
@@ -81,16 +81,15 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
     const msg = await res.text().catch(() => "");
     throw new Error(`${res.status} ${res.statusText} ${msg}`);
   }
-
   return (await res.json()) as T;
 }
 
 export default function ProductsPage() {
   const [rows, setRows] = useState<Product[]>([]);
   const [loading, setLoading] = useState(false);
-
   const [q, setQ] = useState("");
   const [roleId, setRoleId] = useState<number>(0);
+
   const debounceRef = useRef<number | null>(null);
 
   // 모달
@@ -100,7 +99,8 @@ export default function ProductsPage() {
 
   // ✅ 관리 버튼 노출: 관리자(6), 운영자(7)만
   const canManage = roleId === 6 || roleId === 7;
-// ✅ 정렬(표시만)
+
+  // ✅ 정렬(표시만)
   const sortedRows = useMemo(() => sortProducts(rows), [rows]);
 
   // 콤보 옵션
@@ -126,6 +126,7 @@ export default function ProductsPage() {
     } finally {
       setLoading(false);
     }
+  };
 
   // ✅ 권한: 관리자(6), 운영자(7)만 관리 버튼 노출
   const loadRoleId = async () => {
@@ -145,13 +146,11 @@ export default function ProductsPage() {
           setRoleId(Number(rid));
           return;
         }
-      } catch (e) {
+      } catch {
         // 다음 엔드포인트 시도
       }
     }
     setRoleId(0);
-  };
-
   };
 
   useEffect(() => {
@@ -188,7 +187,6 @@ export default function ProductsPage() {
   const onDelete = async (row: Product) => {
     const ok = window.confirm(`삭제(비활성화) 하시겠습니까?\n- ${row.name}`);
     if (!ok) return;
-
     try {
       await fetchJson(`/api/products/${row.id}`, { method: "DELETE" });
       await loadProducts(q);
@@ -212,7 +210,6 @@ export default function ProductsPage() {
           body: JSON.stringify(payload),
         });
       }
-
       setModalOpen(false);
       await loadProducts(q);
     } catch (err: any) {
@@ -222,6 +219,7 @@ export default function ProductsPage() {
 
   // 업로드/다운로드
   const fileRef = useRef<HTMLInputElement | null>(null);
+
   const onUploadClick = () => fileRef.current?.click();
 
   const onUploadFile = async (file: File) => {
@@ -268,8 +266,8 @@ export default function ProductsPage() {
       const m = disp.match(/filename\*?=([^;]+)/i);
       let filename = "products.xlsx";
       if (m?.[1]) filename = m[1].trim().replace(/^UTF-8''/i, "").replace(/\"/g, "").replace(/"/g, "");
-      a.download = filename;
 
+      a.download = filename;
       document.body.appendChild(a);
       a.click();
       a.remove();
@@ -280,17 +278,18 @@ export default function ProductsPage() {
   };
 
   return (
-    <div style={{ padding: 10 }}>
-      <h2 style={{ marginBottom: 12 }}>제품(자재관리)</h2>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 20, marginBottom: 12 }}>
+    <div style={{ padding: 16 }}>
+      <h2 style={{ margin: 0, fontSize: 20, fontWeight: 800 }}>제품(자재관리)</h2>
+
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", marginTop: 12 }}>
         {/* 왼쪽: 검색 + 신규등록 */}
-        <div style={{ display: "flex", alignItems: "center", gap: 15, flex: "0 0 auto" }}>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
           <input
             value={q}
             onChange={(e) => setQ(e.target.value)}
             placeholder="검색 (항목/구분/모델명/규격/비고)"
             style={{
-              width: 350, // 기존 대비 축소(대략 1/4 체감)
+              width: 350,
               padding: "8px 10px",
               borderRadius: 8,
               border: "1px solid rgba(255,255,255,0.15)",
@@ -299,45 +298,62 @@ export default function ProductsPage() {
             }}
           />
           {canManage && (
-
-          <button
-            onClick={onOpenCreate}
-            style={{
-              padding: "8px 14px",
-              borderRadius: 10,
-              border: "1px solid rgba(255,255,255,0.20)",
-              background: "linear-gradient(180deg, #2563EB 0%, #1D4ED8 100%)",
-              color: "#fff",
-              fontWeight: 700,
-              letterSpacing: "0.2px",
-              cursor: "pointer",
-              whiteSpace: "nowrap",
-            }}
-          >
-            +신규 등록
-          </button>
+            <button
+              onClick={onOpenCreate}
+              style={{
+                padding: "10px 12px",
+				fontWeight: 900,
+                borderRadius: 12,
+                border: "1px solid rgba(255,255,255,0.15)",
+                background: "linear-gradient(180deg, #2563EB 0%, #1D4ED8 100%)",
+                color: "#fff",
+                
+              }}
+            >
+              +신규 등록
+            </button>
           )}
         </div>
 
         {/* 오른쪽: 업로드/다운로드 */}
         {canManage && (
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <button onClick={onUploadClick} style={{ padding: "8px 12px" }}>
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <button
+              onClick={onUploadClick}
+              style={{
+                padding: "8px 12px",
+                borderRadius: 8,
+                border: "1px solid rgba(255,255,255,0.15)",
+                background: "rgba(255,255,255,0.08)",
+                color: "#fff",
+                cursor: "pointer",
+              }}
+            >
               파일 업로드
             </button>
-            <button onClick={onDownload} style={{ padding: "8px 12px" }}>
+
+            <button
+              onClick={onDownload}
+              style={{
+                padding: "8px 12px",
+                borderRadius: 8,
+                border: "1px solid rgba(255,255,255,0.15)",
+                background: "rgba(255,255,255,0.08)",
+                color: "#fff",
+                cursor: "pointer",
+              }}
+            >
               다운로드
             </button>
 
             <input
               ref={fileRef}
               type="file"
-              accept=".xlsx"
+              accept=".xlsx,.xls"
               style={{ display: "none" }}
               onChange={async (e) => {
                 const f = e.target.files?.[0];
                 if (!f) return;
-
                 try {
                   await onUploadFile(f);
                 } catch (err: any) {
@@ -351,14 +367,9 @@ export default function ProductsPage() {
         )}
       </div>
 
-      <ProductTable
-        rows={sortedRows}
-        loading={loading}
-        roleId={roleId}
-        forceManage={canManage}
-        onEdit={onOpenEdit}
-        onDelete={onDelete}
-      />
+      <div style={{ marginTop: 12 }}>
+        <ProductTable rows={sortedRows} loading={loading} roleId={roleId} onEdit={onOpenEdit} onDelete={onDelete} />
+      </div>
 
       <ProductFormModal
         open={modalOpen}

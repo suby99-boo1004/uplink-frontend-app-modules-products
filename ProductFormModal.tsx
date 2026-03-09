@@ -153,14 +153,21 @@ export default function ProductFormModal({
     }
     setSaving(true);
     try {
+      // '자동' 선택(=null)인 경우, 계산값을 실제 저장값으로 전송한다.
+      // - 소보수가: 설계가의 85%
+      // - 납품가: (소보수가 or 자동 소보수가)의 82%
+      const finalSmall = priceSmall === null ? autoSmall : priceSmall;
+      const finalDelivery = priceDelivery === null ? autoDelivery : priceDelivery;
+
       await onSave({
         item_name: itemName.trim(),
         category_name: categoryName.trim(),
         name: name.trim(),
         spec: spec.trim(),
         price_design: priceDesign,
-        price_small: priceSmall === null ? undefined : priceSmall,
-        price_delivery: priceDelivery === null ? undefined : priceDelivery,
+        // 자동이면 undefined로 보내지 말고 계산값을 넣어서 0으로 떨어지는 현상을 방지
+        price_small: finalSmall,
+        price_delivery: finalDelivery,
         stock_qty: stockQty,
         memo: memo.trim(),
       });
